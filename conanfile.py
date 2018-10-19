@@ -13,22 +13,66 @@ class ZMQConan(ConanFile):
     description = "ZeroMQ is a community of projects focused on decentralized messaging and computing"
     license = "LGPL-3.0"
     exports = ["LICENSE.md"]
-    exports_sources = ['FindZeroMQ.cmake', 'Findlibzmq.cmake', 'CMakeLists.txt']
     settings = "os", "arch", "compiler", "build_type"
     options = {"shared": [True, False], "fPIC": [True, False], "encryption": [None, "libsodium", "tweetnacl"]}
     default_options = "shared=False", "fPIC=True", "encryption=libsodium"
     generators = ['cmake']
 
-    def build_cmake(self):
-        cmake = CMake(self)
-        if self.settings.compiler != 'Visual Studio':
-            cmake.definitions['CMAKE_POSITION_INDEPENDENT_CODE'] = self.options.fPIC
-        cmake.definitions['ENABLE_CURVE'] = self.options.encryption is not None
-        cmake.definitions['WITH_LIBSODIUM'] = self.options.encryption == "libsodium"
-        cmake.definitions['CMAKE_INSTALL_LIBDIR'] = 'lib'
-        cmake.configure(build_dir='build')
-        cmake.build()
-        cmake.install()
+    def source(self):
+        # see https://github.com/zeromq/libzmq/issues/2597
+        extracted_dir = "libzmq-%s" % self.version
+        archive_name = "v%s.tar.gz" % self.version
+        source_url = "https://github.com/zeromq/libzmq/archive/%s" % archive_name
+        tools.get(source_url)
+        os.rename(extracted_dir, "sources")
+
+        # Need CMP0042 and CMP0068 to make rpaths work properly.
+        tools.replace_in_file(os.path.join('sources', 'CMakeLists.txt'),
+                      'cmake_minimum_required (VERSION 2.8.12)',
+                      r'''cmake_minimum_required (VERSION 3.10)
+
+# use, i.e. don't skip the full RPATH for the build tree
+SET(CMAKE_SKIP_BUILD_RPATH FALSE)
+
+# when building, don't use the install RPATH already
+# (but later on when installing)
+SET(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+
+SET(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+
+# add the automatically determined parts of the RPATH
+# which point to directories outside the build tree to the install RPATH
+SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+# the RPATH to be used when installing, but only if it's not a system directory
+LIST(FIND CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES "${CMAKE_INSTALL_PREFIX}/lib" isSystemDir)
+IF("${isSystemDir}" STREQUAL "-1")
+   SET(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+ENDIF()
+''')
+
+        # disable precompiled headers
+        # fatal error C1083: Cannot open precompiled header file: 'precompiled.pch': Permission denied
+        tools.replace_in_file(os.path.join('sources', 'CMakeLists.txt'),
+                              "if (MSVC)\n    # default for all sources is to use precompiled header",
+                              "if (MSVC_DISABLED)\n    # default for all sources is to use precompiled header")
+
+        # fix PDB location
+        tools.replace_in_file(os.path.join('sources', 'CMakeLists.txt'),
+                              'install (FILES ${CMAKE_CURRENT_BINARY_DIR}/bin/libzmq',
+                              'install (FILES ${CMAKE_BINARY_DIR}/bin/libzmq')
+
+        tools.replace_in_file(os.path.join('sources', 'builds', 'cmake', 'platform.hpp.in'),
+                              'HAVE_LIBSODIUM', 'ZMQ_USE_LIBSODIUM')
+
+        tools.replace_in_file(
+            "sources/CMakeLists.txt",
+            "project (ZeroMQ)",
+            """project (ZeroMQ)
+include("${CMAKE_BINARY_DIR}/conanbuildinfo.cmake")
+set(CMAKE_PREFIX_PATH "${CONAN_CMAKE_MODULE_PATH}")
+include(GNUInstallDirs)""",
+        )
 
     def configure(self):
         if self.settings.compiler == 'Visual Studio':
@@ -49,27 +93,16 @@ class ZMQConan(ConanFile):
                 installer = tools.SystemPackageTool()
                 installer.install('pkg-config%s' % arch)
 
-    def source(self):
-        # see https://github.com/zeromq/libzmq/issues/2597
-        extracted_dir = "libzmq-%s" % self.version
-        archive_name = "v%s.tar.gz" % self.version
-        source_url = "https://github.com/zeromq/libzmq/archive/%s" % archive_name
-        tools.get(source_url)
-        os.rename(extracted_dir, "sources")
-
-        # disable precompiled headers
-        # fatal error C1083: Cannot open precompiled header file: 'precompiled.pch': Permission denied
-        tools.replace_in_file(os.path.join('sources', 'CMakeLists.txt'),
-                              "if (MSVC)\n    # default for all sources is to use precompiled header",
-                              "if (MSVC_DISABLED)\n    # default for all sources is to use precompiled header")
-
-        # fix PDB location
-        tools.replace_in_file(os.path.join('sources', 'CMakeLists.txt'),
-                              'install (FILES ${CMAKE_CURRENT_BINARY_DIR}/bin/libzmq',
-                              'install (FILES ${CMAKE_BINARY_DIR}/bin/libzmq')
-
-        tools.replace_in_file(os.path.join('sources', 'builds', 'cmake', 'platform.hpp.in'),
-                              'HAVE_LIBSODIUM', 'ZMQ_USE_LIBSODIUM')
+    def build_cmake(self):
+        cmake = CMake(self)
+        if self.settings.compiler != 'Visual Studio':
+            cmake.definitions['CMAKE_POSITION_INDEPENDENT_CODE'] = self.options.fPIC
+        cmake.definitions['ENABLE_CURVE'] = self.options.encryption is not None
+        cmake.definitions['WITH_LIBSODIUM'] = self.options.encryption == "libsodium"
+        cmake.definitions['CMAKE_INSTALL_LIBDIR'] = 'lib'
+        cmake.configure(source_folder="sources")
+        cmake.build()
+        cmake.install()
 
     def build(self):
         if self.settings.compiler == 'Visual Studio':
@@ -79,8 +112,6 @@ class ZMQConan(ConanFile):
             self.build_cmake()
 
     def package(self):
-        self.copy('FindZeroMQ.cmake')  # for cppzmq
-        self.copy('Findlibzmq.cmake')  # for czmq
         self.copy(pattern="COPYING", src='sources', dst='license')
         if self.options.shared:
             exts = ['*.a']
